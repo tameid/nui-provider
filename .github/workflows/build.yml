@@ -1,0 +1,62 @@
+# Phase 1: the format and the IPC are the contract. Both are cheap to test,
+# so test them on every push rather than finding out from a guest that decodes
+# garbage poses.
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows / MSVC
+            os: windows-2025-vs2026
+            generator: Ninja
+          - name: Linux / Clang
+            os: ubuntu-24.04
+            generator: Unix Makefiles
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -G "${{ matrix.generator }}"
+          -DCMAKE_BUILD_TYPE=Release
+          -DNUI_PROVIDER_WERROR=ON
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --build-config Release
+
+  # The provider must not be able to ship a layout change silently: a shifted
+  # field would decode in the guest as a plausible-looking wrong pose.
+  format-contract:
+    name: wire format is unchanged
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure and test (size assertions live in the test binary)
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNUI_PROVIDER_BUILD_TESTS=ON
+          cmake --build build --parallel
+          ./build/bin/nui_tests "[format]"
+
+      - name: Report encoded sizes
+        run: |
+          echo "A change here means a version bump, not an edit:" >> "$GITHUB_STEP_SUMMARY"
+          echo '  sizeof(NuiFrameHeader)  = 44' >> "$GITHUB_STEP_SUMMARY"
+          echo '  sizeof(NuiJoint)        = 36' >> "$GITHUB_STEP_SUMMARY"
+          echo '  sizeof(NuiSkeleton)     = 82 + 36*20 = 802' >> "$GITHUB_STEP_SUMMARY"

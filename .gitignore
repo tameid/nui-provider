@@ -1,0 +1,22 @@
+# Build output
+build/
+out/
+cmake-build-*/
+
+# CMake / Ninja scratch
+CMakeCache.txt
+CMakeFiles/
+.ninja_deps
+.ninja_log
+compile_commands.json
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Provider runtime output
+frames/
+*.nui
