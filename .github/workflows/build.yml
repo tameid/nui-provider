@@ -48,6 +48,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Configure and test (size assertions live in the test binary)
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNUI_PROVIDER_BUILD_TESTS=ON
