@@ -15,7 +15,7 @@ wire format in `include/nui/frame.h`.
 | wire format v1, frozen | done — `include/nui/frame.h` |
 | IPC writer, double-buffered | done — `src/ipc/file_writer.cc` |
 | `synthetic` backend | done — deterministic, CI-safe, no hardware |
-| `replay` backend | next |
+| session recording + `replay` backend | done — `.nui` files |
 | pose front-end / mapper / smoother | Phase 4+ (`webcam`, `phone`, `hardware`) |
 
 The point of doing the format and the IPC before any pose code is that a title
@@ -50,10 +50,51 @@ cmake --build build
 
 # 30 Hz forever
 ./build/bin/nui-provider --dir frames --interval-ms 33
+
+# record a session, then replay it (looping) into a live IPC directory
+./build/bin/nui-provider --dir frames --record run.nui --interval-ms 33
+./build/bin/nui-provider --dir frames-replay --replay run.nui --loop
 ```
 
 `--dir` is where the guest plugin looks (see below). `--interval-ms 0` emits as
 fast as the disk allows, which is what a burst/replay consumer wants.
+
+## Recordings
+
+`--record` captures everything produced into a `.nui` session; `--replay` plays
+one back. Replay re-emits recorded frames **verbatim**, including their original
+frame ids and capture timestamps. A title that reacts to timing — and they all
+do — must see the timing that caused the original problem, or the reproduction
+is fiction.
+
+Two failure modes are treated as errors rather than silently tolerated:
+
+- **A recording with zero frames** is refused. That is what a recording killed
+  before it was finalised looks like, and replaying it would resemble a title
+  that ignored every frame.
+- **A truncated session** stops with an error instead of replaying fewer frames
+  than the header claims.
+
+`--record` refuses to overwrite an existing session, because a second recording
+to the same path would destroy the only copy of a reproduction.
+
+Session layout (`include/nui/session.h`, 60-byte header then frames):
+
+```
+magic 'XNRS' | version | flags | frame_count | max_skeletons | hz
+created_unix_us | backend[32]
+<frames, each in exactly the frozen wire format>
+```
+
+There is deliberately no second length scheme: each frame's own header says how
+many skeletons it has, so a session frame and a live IPC frame are the same
+bytes for the same data. That is what makes a recording trustworthy as a
+reproduction.
+
+Not compressed. A two-skeleton frame is 1648 bytes, so 30 Hz for a minute is
+about 3 MB. If that becomes a problem, compress the whole file rather than doing
+per-frame delta coding — the frames are already small and it would put a decoder
+on the guest-facing side for no benefit.
 
 ## The IPC protocol
 
@@ -106,6 +147,11 @@ header lying about its skeleton count.
 
 `tests/ipc_test.cc` checks the handoff invariants — `frame.idx` alternates, the
 slot it names is always complete, and no temp file survives.
+
+`tests/session_test.cc` holds the line that makes a reproduction worth
+anything: replay must emit the same bytes that were recorded. It also covers
+exhaustion, looping, the recorded inter-frame interval, truncation, and the
+refusal to clobber an existing session.
 
 ## Licence
 

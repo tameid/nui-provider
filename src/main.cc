@@ -13,12 +13,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
+#include "backend.h"
+#include "backends/replay/replay.h"
 #include "backends/synthetic/synthetic.h"
 #include "ipc/file_writer.h"
 #include "nui/frame.h"
+#include "recorder/session_writer.h"
 
 namespace {
 
@@ -26,16 +30,26 @@ void PrintUsage(const char* argv0) {
   std::printf(
       "usage: %s [options]\n"
       "\n"
-      "  --dir <path>       IPC directory to publish frames into (required)\n"
-      "  --skeletons <n>    number of skeletons to emit          (default 1)\n"
-      "  --hz <n>           frame rate                           (default 30)\n"
-      "  --frames <n>       stop after n frames, 0 = run forever  (default 0)\n"
-      "  --interval-ms <n>  wall-clock sleep between frames      (default 0,\n"
-      "                     i.e. emit as fast as the disk allows)\n"
-      "  --help             this text\n"
+      "Source (choose one):\n"
+      "  --replay <path>      play back a recorded .nui session\n"
+      "                       (default source is the synthetic backend)\n"
+      "  --skeletons <n>      skeletons the synthetic backend emits  (default 1)\n"
+      "  --hz <n>             synthetic capture rate                   (default 30)\n"
       "\n"
-      "Phase 1 backend is 'synthetic': a deterministic scripted skeleton, no\n"
-      "hardware involved. Every frame it writes carries kFrameFlagSynthetic.\n",
+      "Output:\n"
+      "  --dir <path>         IPC directory to publish frames into (required)\n"
+      "  --record <path>      also record everything produced to a .nui session\n"
+      "\n"
+      "Pacing:\n"
+      "  --interval-ms <n>    wall-clock sleep between frames  (default 0,\n"
+      "                       i.e. as fast as the disk allows)\n"
+      "  --loop               with --replay, restart at the end instead of stopping\n"
+      "  --frames <n>         stop after n frames, 0 = until the source ends\n"
+      "                       (default 0)\n"
+      "\n"
+      "  --help               this text\n"
+      "\n"
+      "Phase 1 backends: 'synthetic' (deterministic, no hardware) and 'replay'.\n",
       argv0);
 }
 
@@ -72,10 +86,13 @@ void SleepMs(uint32_t ms) {
 
 int main(int argc, char** argv) {
   std::string directory;
+  std::string replay_path;
+  std::string record_path;
   uint32_t skeleton_count = 1;
   uint32_t hz = 30;
   uint32_t frame_limit = 0;
   uint32_t interval_ms = 0;
+  bool loop = false;
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -88,6 +105,14 @@ int main(int argc, char** argv) {
     if (arg == "--dir") {
       if (!next) { PrintUsage(argv[0]); return 2; }
       directory = next;
+      ++i;
+    } else if (arg == "--replay") {
+      if (!next) { PrintUsage(argv[0]); return 2; }
+      replay_path = next;
+      ++i;
+    } else if (arg == "--record") {
+      if (!next) { PrintUsage(argv[0]); return 2; }
+      record_path = next;
       ++i;
     } else if (arg == "--skeletons") {
       if (!ParseU32("--skeletons", next, &skeleton_count)) return 2;
@@ -104,6 +129,8 @@ int main(int argc, char** argv) {
     } else if (arg == "--interval-ms") {
       if (!ParseU32("--interval-ms", next, &interval_ms)) return 2;
       ++i;
+    } else if (arg == "--loop") {
+      loop = true;
     } else {
       std::fprintf(stderr, "unknown option: %s\n", arg.c_str());
       PrintUsage(argv[0]);
@@ -117,6 +144,28 @@ int main(int argc, char** argv) {
     return 2;
   }
 
+  // Build the source. Replay wins over synthetic when both are implied, since
+  // asking for a recording to be replayed while generating one is nonsense.
+  std::unique_ptr<nui::Backend> backend;
+  std::unique_ptr<nui::ReplayBackend> replay;
+  if (!replay_path.empty()) {
+    replay = std::make_unique<nui::ReplayBackend>();
+    if (!replay->Open(replay_path, loop)) {
+      std::fprintf(stderr, "cannot replay %s: %s\n", replay_path.c_str(),
+                   replay->error().c_str());
+      return 1;
+    }
+    std::printf("replaying %s: %u frames at %u Hz\n", replay_path.c_str(),
+                replay->frame_count(), replay->hz());
+    // Read the rate before handing ownership over: after the move `replay` is
+    // null and any further use of it is a null dereference.
+    hz = replay->hz();
+    backend = std::move(replay);
+  } else {
+    backend = std::make_unique<nui::SyntheticBackend>(skeleton_count, hz);
+    std::printf("synthetic: %u skeleton(s) at %u Hz\n", skeleton_count, hz);
+  }
+
   nui::FileWriter writer;
   if (!writer.Open(directory)) {
     std::fprintf(stderr, "failed to open %s: %s\n", directory.c_str(),
@@ -124,39 +173,83 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  std::printf("nui-provider (synthetic) -> %s\n", directory.c_str());
-  std::printf("  %u skeleton(s), %u Hz%s\n", skeleton_count, hz,
-              frame_limit ? ", bounded" : ", until killed");
+  nui::SessionWriter recorder;
+  if (!record_path.empty()) {
+    if (!recorder.Open(record_path, backend->name(), hz)) {
+      std::fprintf(stderr, "cannot record to %s: %s\n", record_path.c_str(),
+                   recorder.error().c_str());
+      return 1;
+    }
+    std::printf("recording to %s\n", record_path.c_str());
+  }
+
+  std::printf("publishing to %s\n", directory.c_str());
+  if (frame_limit) {
+    std::printf("  bounded at %u frames\n", frame_limit);
+  }
   std::fflush(stdout);
 
-  nui::SyntheticBackend backend(skeleton_count, hz);
   nui::NuiFrameHeader header = {};
   std::vector<nui::NuiSkeleton> skeletons;
 
   uint32_t emitted = 0;
-  while (frame_limit == 0 || emitted < frame_limit) {
-    backend.NextFrame(&header, &skeletons);
+  // A replay with no frame limit runs until the session ends; without this,
+  // a non-looping replay would spin forever on an exhausted source.
+  const bool bounded = frame_limit != 0;
+
+  while (!bounded || emitted < frame_limit) {
+    const uint32_t count = backend->NextFrame(&header, &skeletons);
+    if (count == 0) {
+      // Either the source ended or it failed. Only a failure has an error.
+      nui::ReplayBackend* as_replay = dynamic_cast<nui::ReplayBackend*>(backend.get());
+      if (as_replay != nullptr && !as_replay->error().empty()) {
+        std::fprintf(stderr, "replay failed at frame %u: %s\n", emitted,
+                     as_replay->error().c_str());
+        recorder.Close();
+        return 1;
+      }
+      std::printf("\nsource exhausted after %u frames\n", emitted);
+      break;
+    }
+
     if (!writer.Write(header, skeletons.data(),
                       static_cast<uint32_t>(skeletons.size()))) {
       std::fprintf(stderr, "write failed: %s\n", writer.error().c_str());
+      recorder.Close();
+      return 1;
+    }
+    if (recorder.is_open() &&
+        !recorder.Append(header, skeletons.data(),
+                         static_cast<uint32_t>(skeletons.size()))) {
+      std::fprintf(stderr, "record failed: %s\n", recorder.error().c_str());
       return 1;
     }
     ++emitted;
 
     if (emitted % 300 == 0) {
-      std::printf("  %u frames published\n", emitted);
+      std::printf("  %u frames\n", emitted);
       std::fflush(stdout);
     }
 
+    // Replay paces itself from the recording when asked, so a real-time session
+    // replays at its original speed rather than the provider's guess at hz.
     if (interval_ms) {
       SleepMs(interval_ms);
     } else {
-      // No pacing requested: emit as fast as the disk takes it, which is what
-      // a burst/replay use wants.
       SleepMs(0);
     }
   }
 
-  std::printf("done: %u frames\n", writer.frames_written());
+  if (recorder.is_open()) {
+    if (!recorder.Close()) {
+      std::fprintf(stderr, "failed to finalise %s: %s\n", record_path.c_str(),
+                   recorder.error().c_str());
+      return 1;
+    }
+    std::printf("recorded %u frames to %s\n", recorder.frames_recorded(),
+                record_path.c_str());
+  }
+
+  std::printf("done: %u frames published\n", writer.frames_written());
   return 0;
 }

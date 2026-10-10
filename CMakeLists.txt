@@ -33,7 +33,9 @@ endif()
 
 add_library(nui_core STATIC
   src/backends/synthetic/synthetic.cc
+  src/backends/replay/replay.cc
   src/ipc/file_writer.cc
+  src/recorder/session_writer.cc
 )
 target_include_directories(nui_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -62,7 +64,11 @@ endif()
 if(NUI_PROVIDER_BUILD_TESTS)
   enable_testing()
   add_subdirectory(third_party/catch EXCLUDE_FROM_ALL)
-  add_executable(nui_tests tests/codec_test.cc tests/ipc_test.cc)
+  add_executable(nui_tests
+    tests/codec_test.cc
+    tests/ipc_test.cc
+    tests/session_test.cc
+  )
   target_link_libraries(nui_tests PRIVATE nui_core Catch2::Catch2WithMain)
   add_test(NAME nui_tests COMMAND nui_tests)
 endif()

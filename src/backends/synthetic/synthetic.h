@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "backend.h"
 #include "nui/frame.h"
 
 namespace nui {
@@ -21,14 +22,16 @@ namespace nui {
 // Every amplitude is small and the motion is smooth, because a real backend's
 // whole difficulty is the opposite and a synthetic source that jitters would
 // teach us the wrong things about what a title tolerates.
-class SyntheticBackend {
+class SyntheticBackend : public Backend {
  public:
   // `skeleton_count` skeletons, `hz` frames per second of internal clock.
   SyntheticBackend(uint32_t skeleton_count, uint32_t hz);
 
-  // Advances internal time by one tick and fills `out`. Returns the number of
-  // skeletons written. frame_id is updated and stamped on the header.
-  uint32_t NextFrame(NuiFrameHeader* header, std::vector<NuiSkeleton>* out);
+  uint32_t NextFrame(NuiFrameHeader* header,
+                     std::vector<NuiSkeleton>* out) override;
+
+  const char* name() const override { return "synthetic"; }
+  uint32_t frames_produced() const override { return frame_id_; }
 
   void Reset();
 
