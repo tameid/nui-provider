@@ -16,6 +16,7 @@ wire format in `include/nui/frame.h`.
 | IPC writer, double-buffered | done — `src/ipc/file_writer.cc` |
 | `synthetic` backend | done — deterministic, CI-safe, no hardware |
 | session recording + `replay` backend | done — `.nui` files |
+| frame inspector | done — `nui-inspect` |
 | pose front-end / mapper / smoother | Phase 4+ (`webcam`, `phone`, `hardware`) |
 
 The point of doing the format and the IPC before any pose code is that a title
@@ -58,6 +59,52 @@ cmake --build build
 
 `--dir` is where the guest plugin looks (see below). `--interval-ms 0` emits as
 fast as the disk allows, which is what a burst/replay consumer wants.
+
+## Looking at the output
+
+`nui-inspect` reads either a live IPC directory or a `.nui` session and prints
+what is actually in it:
+
+```sh
+./build/bin/nui-inspect frames --follow          # watch a live directory
+./build/bin/nui-inspect run.nui --all            # every frame in a recording
+./build/bin/nui-inspect run.nui --joints         # dump every joint
+```
+
+The default view draws the skeleton:
+
+```
+#0  frame=0 skeletons=2 depth=0 ir=0 colour=0 latency=0.0ms [synthetic]
+    skeleton 0: id=1 pelvis=(+0.00,+0.90,+0.00) seated=0 up=1 joints=20/20>=0.50
+    |                                                |
+    |                       #                        |
+    |                       -                        |
+    |                       #                        |
+    |          #------------#------------#           |
+    |         -             -             -          |
+    |        -              -              -         |
+    |       #               -               #        |
+    |      -         #------#------#         -       |
+    |     #          -             -          #      |
+    |    #          -               -          #     |
+    |               -               -                |
+    |               #               #                |
+    |               -               -                |
+    |               -               -                |
+    |               #               #                |
+    |               #               #                |
+```
+
+`#` confident, `+` partial, `.` negligible; `-` is bone, and a bone drawn as
+`.` connects two joints that are individually above threshold but whose shared
+confidence is not.
+
+The drawing is the point. A skeleton that is subtly wrong — an elbow in the
+wrong place, a flipped axis, a collapsed joint — is obvious the moment it is
+drawn and invisible in a table of floats.
+
+It reads a recording with the same code that reads a live directory, on purpose:
+if it could not, the recording would not be a faithful reproduction.
 
 ## Recordings
 
@@ -152,6 +199,10 @@ slot it names is always complete, and no temp file survives.
 anything: replay must emit the same bytes that were recorded. It also covers
 exhaustion, looping, the recorded inter-frame interval, truncation, and the
 refusal to clobber an existing session.
+
+`tests/inspect_test.cc` covers the renderer and the source reader, because the
+renderer is not decoration — a mis-projected skeleton looks fine on screen and
+misleads whoever is debugging a title.
 
 ## Licence
 

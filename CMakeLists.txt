@@ -61,6 +61,27 @@ if(MSVC)
   target_compile_options(nui-provider PRIVATE /W4 /permissive-)
 endif()
 
+# The inspector reads what the provider published. It shares the decoder and
+# the wire format, so it can also read a recording - if it could not, the
+# recording would not be a faithful reproduction. In a library so the tests can
+# link it too; the renderer and the source reader are worth testing directly.
+add_library(nui_tools STATIC
+  src/tools/frame_source.cc
+  src/tools/ascii_skeleton.cc
+)
+target_link_libraries(nui_tools PUBLIC nui_core)
+if(MSVC)
+  target_compile_options(nui_tools PRIVATE /W4 /permissive-)
+else()
+  target_compile_options(nui_tools PRIVATE -Wall -Wextra)
+endif()
+
+add_executable(nui-inspect src/tools/inspect_main.cc)
+target_link_libraries(nui-inspect PRIVATE nui_tools)
+if(MSVC)
+  target_compile_options(nui-inspect PRIVATE /W4 /permissive-)
+endif()
+
 if(NUI_PROVIDER_BUILD_TESTS)
   enable_testing()
   add_subdirectory(third_party/catch EXCLUDE_FROM_ALL)
@@ -68,8 +89,9 @@ if(NUI_PROVIDER_BUILD_TESTS)
     tests/codec_test.cc
     tests/ipc_test.cc
     tests/session_test.cc
+    tests/inspect_test.cc
   )
-  target_link_libraries(nui_tests PRIVATE nui_core Catch2::Catch2WithMain)
+  target_link_libraries(nui_tests PRIVATE nui_tools Catch2::Catch2WithMain)
   add_test(NAME nui_tests COMMAND nui_tests)
 endif()
 
