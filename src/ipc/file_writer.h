@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 
+#include "backend.h"
 #include "nui/frame.h"
 
 namespace nui {
@@ -34,10 +35,18 @@ class FileWriter {
   // path is read-only is worse than one that reports it.
   bool Open(const std::string& directory);
 
-  // Encodes and publishes one frame. `header` and `skeletons` are only read
-  // during the call. Returns false on I/O failure.
+  // Encodes and publishes one frame. `header`, `skeletons` and `images` are only
+  // read during the call. Returns false on I/O failure.
+  //
+  // The overload without images is the skeleton-only case and is kept because
+  // that is still the common one; it produces a frame with all three image
+  // counts zero.
   bool Write(const NuiFrameHeader& header, const NuiSkeleton* skeletons,
              uint32_t skeleton_count);
+
+  bool Write(const NuiFrameHeader& header, const NuiSkeleton* skeletons,
+             uint32_t skeleton_count, const BackendImage* images,
+             uint32_t image_count);
 
   // Where the guest should look, for docs and error messages.
   const std::string& directory() const { return directory_; }

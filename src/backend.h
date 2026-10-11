@@ -15,18 +15,36 @@
 
 namespace nui {
 
+// An image a backend produced: the wire header plus a pointer to pixels the
+// backend owns and keeps alive until the next call to NextFrame.
+//
+// The lifetime is the whole reason this is a separate struct rather than just
+// NuiImage. A depth frame is 320x240x2 = 153600 bytes; copying that per frame
+// would be the dominant cost of the program, and the backend is already holding
+// it.
+struct BackendImage {
+  NuiImage header;
+  const uint8_t* data = nullptr;
+};
+
 class Backend {
  public:
   virtual ~Backend() = default;
 
-  // Produces the next frame. `out` is resized to the skeleton count and fully
-  // overwritten. Returns the number of skeletons written.
+  // Produces the next frame. `skeletons` is resized to the skeleton count and
+  // fully overwritten; `images` is cleared and refilled. Returns the number of
+  // skeletons written.
+  //
+  // A backend may return 0 skeletons and still supply images. That is not a
+  // degenerate case: depth is the primitive and skeleton is derived from it, so
+  // a frame with depth but no tracked player is an ordinary thing to see.
   //
   // Frame ids and timestamps are monotonic within a backend. A backend that
   // replays a recording preserves the recorded values rather than restamping,
   // because a title that reacts to frame timing must see the original timing.
   virtual uint32_t NextFrame(NuiFrameHeader* header,
-                             std::vector<NuiSkeleton>* out) = 0;
+                             std::vector<NuiSkeleton>* skeletons,
+                             std::vector<BackendImage>* images) = 0;
 
   // Short identifier recorded in the session header, e.g. "synthetic".
   virtual const char* name() const = 0;

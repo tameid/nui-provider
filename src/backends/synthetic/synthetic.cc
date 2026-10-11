@@ -1,5 +1,6 @@
 #include "backends/synthetic/synthetic.h"
 
+#include <algorithm>
 #include <cmath>
 
 #include "nui/encode.h"
@@ -14,6 +15,113 @@ constexpr float kRestHeight = 1.7f;
 
 constexpr float kPi = 3.14159265358979323846f;
 
+// Depth-camera intrinsics for the retail 320x240 stream. A real backend reads
+// these from the device's factory calibration; a synthetic one has to assert
+// them, and asserting the documented values is more honest than inventing
+// convenient ones.
+constexpr float kFocalLengthPixels = 285.0f;
+constexpr float kFarMillimetres = 4000;  // beyond the sensor's useful range
+constexpr uint32_t kMaxTrackedPlayers = 7;  // 3 bits
+
+// Where the camera sits, in the same world space the skeletons are expressed in.
+//
+// This is not redundant. Skeleton coordinates are metric and camera-relative in
+// the NUI model, but the rest pose above is built with y = 0 at the feet and the
+// body at z = 0, which puts it *on* the origin. A renderer that assumes the
+// camera is at the origin therefore projects the whole body at depth 0 and
+// clips it away - which is exactly what an all-background depth image looks
+// like, and why the first run of this produced no body at all.
+//
+// A real backend gets this from the device pose. Asserting it here keeps the
+// synthetic body standing where a player actually stands: about 2.5 m in front
+// of the camera, head comfortably inside the vertical field of view.
+constexpr float kCameraZ = -2.5f;   // camera looks down +Z at the body
+constexpr float kCameraHeight = 1.0f;
+
+// Limb radius, so a projected limb has thickness. Halved with distance by
+// DrawBone to stay roughly constant in pixels.
+constexpr float kLimbRadiusMetres = 0.05f;
+
+// Projects a world point into depth-image pixel coordinates.
+//
+// World space is +X right, +Y up, -Z into the screen. The camera is at
+// (0, kCameraHeight, kCameraZ) looking towards +Z, so a point's depth is its
+// distance along +Z from the camera - not simply -z. Getting that wrong is what
+// made the first depth render come out empty.
+bool ProjectPoint(const float world[3], float focal_px, float cx, float cy,
+                  float* out_x, float* out_y, uint16_t* out_depth_mm) {
+  const float z = world[2] - kCameraZ;
+  if (z <= 0.01f) {
+    return false;  // behind or level with the camera
+  }
+  *out_x = cx + (world[0] / z) * focal_px;
+  // Height relative to the camera, then flipped: +Y is up, image Y is down.
+  *out_y = cy - ((world[1] - kCameraHeight) / z) * focal_px;
+  const float mm = z * 1000.0f;
+  if (mm <= 0.0f || mm > static_cast<float>(kDepthMaxMillimetres)) {
+    return false;
+  }
+  *out_depth_mm = static_cast<uint16_t>(mm);
+  return true;
+}
+
+// Writes a disc of `radius_px` at (x, y). Nearer samples win, which is what a
+// real depth sensor reports for a limb occluding a torso.
+void Splat(uint16_t* px, int x, int y, uint16_t depth_mm, uint8_t player_index,
+           float radius_px) {
+  const int r = static_cast<int>(radius_px + 0.5f);
+  for (int dy = -r; dy <= r; ++dy) {
+    const int py = y + dy;
+    if (py < 0 || py >= kDepthHeight) {
+      continue;
+    }
+    for (int dx = -r; dx <= r; ++dx) {
+      const int pxx = x + dx;
+      if (pxx < 0 || pxx >= kDepthWidth) {
+        continue;
+      }
+      if (dx * dx + dy * dy > r * r) {
+        continue;  // outside the disc
+      }
+      uint16_t& target = px[static_cast<size_t>(py) * kDepthWidth + pxx];
+      if (DepthPixelMillimetres(target) > depth_mm) {
+        target = PackDepthPixel(depth_mm, player_index);
+      }
+    }
+  }
+}
+
+// Draws a limb as a chain of discs between two projected joints. Sampling along
+// the segment is what closes the gaps a two-point splat would leave, which a
+// title doing silhouette extraction would read as a broken body.
+void DrawBone(uint16_t* px, const float from[3], const float to[3], float focal_px,
+              float cx, float cy, uint8_t player_index) {
+  float ax, ay, bx, by;
+  uint16_t az, bz;
+  if (!ProjectPoint(from, focal_px, cx, cy, &ax, &ay, &az) ||
+      !ProjectPoint(to, focal_px, cx, cy, &bx, &by, &bz)) {
+    return;
+  }
+
+  // Limb radius shrinks with distance, so it stays roughly constant in pixels
+  // the way a real limb does.
+  const float depth_m = static_cast<float>(az) / 1000.0f;
+  const float radius_px = (kLimbRadiusMetres / std::max(depth_m, 0.1f)) * focal_px;
+  const int radius = std::max(1, static_cast<int>(radius_px + 0.5f));
+
+  // Steps scaled so consecutive splats overlap rather than leaving gaps.
+  const float span = std::sqrt((bx - ax) * (bx - ax) + (by - ay) * (by - ay));
+  const int steps = std::max(1, static_cast<int>(span / std::max(1, radius)));
+
+  for (int i = 0; i <= steps; ++i) {
+    const float t = static_cast<float>(i) / static_cast<float>(steps);
+    const int x = static_cast<int>(ax + (bx - ax) * t + 0.5f);
+    const int y = static_cast<int>(ay + (by - ay) * t + 0.5f);
+    const auto depth = static_cast<uint16_t>(az + (bz - az) * t);
+    Splat(px, x, y, depth, player_index, static_cast<float>(radius));
+  }
+}
+
 }  // namespace
 
 SyntheticBackend::SyntheticBackend(uint32_t skeleton_count, uint32_t hz)
@@ -26,20 +134,90 @@ void SyntheticBackend::Reset() {
 }
 
 uint32_t SyntheticBackend::NextFrame(NuiFrameHeader* header,
-                                     std::vector<NuiSkeleton>* out) {
+                                     std::vector<NuiSkeleton>* skeletons,
+                                     std::vector<BackendImage>* images) {
   const uint64_t step_us = 1000000ull / hz_;
 
-  out->assign(skeleton_count_, NuiSkeleton{});
+  skeletons->assign(skeleton_count_, NuiSkeleton{});
   for (uint32_t i = 0; i < skeleton_count_; ++i) {
-    FillSkeleton(&(*out)[i], i, capture_us_);
+    FillSkeleton(&(*skeletons)[i], i, capture_us_);
   }
 
   *header = MakeHeader(frame_id_, capture_us_, capture_us_);
   header->flags = kFrameFlagSynthetic;
 
+  images->clear();
+  if (depth_enabled_) {
+    RenderDepth(*skeletons);
+    BackendImage depth;
+    depth.header.width = kDepthWidth;
+    depth.header.height = kDepthHeight;
+    depth.header.format = static_cast<uint8_t>(ImageFormat::kDepth16);
+    depth.header.reserved0 = 0;
+    depth.header.data_size =
+        static_cast<uint32_t>(depth_pixels_.size());
+    depth.data = depth_pixels_.data();
+    images->push_back(depth);
+  }
+
   ++frame_id_;
   capture_us_ += step_us;
   return skeleton_count_;
+}
+
+void SyntheticBackend::RenderDepth(const std::vector<NuiSkeleton>& skeletons) {
+  // Background first: the far plane, player index 0. A real sensor reports no
+  // depth (black) where it cannot see, but a uniform far value is easier to
+  // tell apart from a bug that never wrote the buffer at all.
+  const size_t pixels = static_cast<size_t>(kDepthWidth) * kDepthHeight;
+  depth_pixels_.resize(pixels * 2);
+  uint16_t* px = reinterpret_cast<uint16_t*>(depth_pixels_.data());
+  for (size_t i = 0; i < pixels; ++i) {
+    px[i] = PackDepthPixel(static_cast<uint16_t>(kFarMillimetres), 0);
+  }
+
+  // Pinhole projection matching the 360's depth camera, so a joint at a known
+  // world position lands where a real camera would put it. Constants are the
+  // retail 320x240 depth intrinsics.
+  const float focal_px = kFocalLengthPixels;
+  const float cx = kDepthWidth * 0.5f;
+  const float cy = kDepthHeight * 0.5f;
+
+  // Bones, as joint index pairs. Drawing limbs rather than points is what makes
+  // the image look like a body: a title doing background subtraction needs
+  // contiguous regions, not a scatter of dots.
+  static constexpr Joint kBones[][2] = {
+      {Joint::kHead, Joint::kNeck},
+      {Joint::kNeck, Joint::kSpineChest},
+      {Joint::kSpineChest, Joint::kPelvis},
+      {Joint::kShoulderLeft, Joint::kShoulderRight},
+      {Joint::kShoulderLeft, Joint::kElbowLeft},
+      {Joint::kElbowLeft, Joint::kWristLeft},
+      {Joint::kWristLeft, Joint::kHandLeft},
+      {Joint::kShoulderRight, Joint::kElbowRight},
+      {Joint::kElbowRight, Joint::kWristRight},
+      {Joint::kWristRight, Joint::kHandRight},
+      {Joint::kPelvis, Joint::kHipLeft},
+      {Joint::kHipLeft, Joint::kKneeLeft},
+      {Joint::kKneeLeft, Joint::kAnkleLeft},
+      {Joint::kAnkleLeft, Joint::kFootLeft},
+      {Joint::kPelvis, Joint::kHipRight},
+      {Joint::kHipRight, Joint::kKneeRight},
+      {Joint::kKneeRight, Joint::kAnkleRight},
+      {Joint::kAnkleRight, Joint::kFootRight},
+  };
+
+  for (const NuiSkeleton& s : skeletons) {
+    // Player index is 1-based in NUI: 0 means "no player".
+    const uint8_t player_index = static_cast<uint8_t>(
+        std::min<uint32_t>(s.tracking_id, kMaxTrackedPlayers));
+
+    for (const auto& bone : kBones) {
+      const NuiJoint& a = s.joints[static_cast<uint16_t>(bone[0])];
+      const NuiJoint& b = s.joints[static_cast<uint16_t>(bone[1])];
+      DrawBone(px, a.position, b.position, focal_px, cx, cy, player_index);
+    }
+  }
 }
 
 void SyntheticBackend::FillSkeleton(NuiSkeleton* skeleton, uint32_t index,

@@ -82,14 +82,48 @@ bool ReplayBackend::ReadNextRaw(std::vector<uint8_t>* payload, uint32_t* skeleto
     return false;
   }
 
-  const size_t bytes = static_cast<size_t>(frame.num_skeletons) * sizeof(NuiSkeleton);
-  payload->assign(sizeof(frame) + bytes, 0);
-  std::memcpy(payload->data(), &frame, sizeof(frame));
-  if (bytes) {
-    if (std::fread(payload->data() + sizeof(frame), 1, bytes, file_) != bytes) {
-      error_ = path_ + " frame " + std::to_string(cursor_) + " payload is truncated";
+  // Skeletons first, then images in the fixed depth/ir/color order. Each image
+  // carries its own NuiImage header, so the size is only knowable by walking
+  // them - assuming a size from the skeleton count would silently truncate every
+  // recorded depth frame.
+  const size_t skeleton_bytes =
+      static_cast<size_t>(frame.num_skeletons) * sizeof(NuiSkeleton);
+
+  // Read the skeleton block, then walk the images to find the total length.
+  std::vector<uint8_t> body;
+  body.resize(skeleton_bytes);
+  if (skeleton_bytes &&
+      std::fread(body.data(), 1, skeleton_bytes, file_) != skeleton_bytes) {
+    error_ = path_ + " frame " + std::to_string(cursor_) +
+             " skeleton payload is truncated";
+    return false;
+  }
+
+  const uint32_t image_total = frame.num_depth_frames + frame.num_ir_frames +
+                               frame.num_color_frames;
+  for (uint32_t i = 0; i < image_total; ++i) {
+    NuiImage image = {};
+    if (std::fread(&image, sizeof(image), 1, file_) != 1) {
+      error_ = path_ + " frame " + std::to_string(cursor_) +
+               " image header is truncated";
       return false;
     }
+    body.resize(body.size() + sizeof(image) + image.data_size);
+    std::memcpy(body.data() + body.size() - sizeof(image) - image.data_size, &image,
+                sizeof(image));
+    if (image.data_size &&
+        std::fread(body.data() + body.size() - image.data_size, 1, image.data_size,
+                   file_) != image.data_size) {
+      error_ = path_ + " frame " + std::to_string(cursor_) +
+               " image data is truncated";
+      return false;
+    }
+  }
+
+  payload->assign(sizeof(frame) + body.size(), 0);
+  std::memcpy(payload->data(), &frame, sizeof(frame));
+  if (!body.empty()) {
+    std::memcpy(payload->data() + sizeof(frame), body.data(), body.size());
   }
 
   *skeletons = frame.num_skeletons;
@@ -98,7 +132,8 @@ bool ReplayBackend::ReadNextRaw(std::vector<uint8_t>* payload, uint32_t* skeleto
 }
 
 uint32_t ReplayBackend::NextFrame(NuiFrameHeader* header,
-                                  std::vector<NuiSkeleton>* out) {
+                                  std::vector<NuiSkeleton>* out,
+                                  std::vector<BackendImage>* images) {
   if (!file_) {
     error_ = "not open";
     return 0;
@@ -113,6 +148,7 @@ uint32_t ReplayBackend::NextFrame(NuiFrameHeader* header,
       // provider tells "no more frames" from "a frame with zero skeletons".
       *header = NuiFrameHeader{};
       out->clear();
+      images->clear();
       return 0;
     }
     if (!Restart()) {
@@ -146,6 +182,27 @@ uint32_t ReplayBackend::NextFrame(NuiFrameHeader* header,
     std::memcpy(out->data(), decoded.skeletons,
                 static_cast<size_t>(skeleton_count) * sizeof(NuiSkeleton));
   }
+
+  // Replay hands the recorded pixels straight back. They live in `payload`,
+  // which is only valid until the next read, so copy them into storage this
+  // backend owns for as long as the Backend contract promises the caller.
+  images->clear();
+  replay_images_.clear();
+  replay_pixels_.clear();
+  for (uint32_t i = 0; i < decoded.image_count; ++i) {
+    // Deep copy: the decoded pointers aim into `payload`, which the next read
+    // overwrites, so handing them straight out would break the contract.
+    replay_pixels_.insert(replay_pixels_.end(), decoded.images[i].data,
+                          decoded.images[i].data +
+                              decoded.images[i].header.data_size);
+    BackendImage image;
+    image.header = decoded.images[i].header;
+    image.data = replay_pixels_.data() + (replay_pixels_.size() -
+                                          decoded.images[i].header.data_size);
+    replay_images_.push_back(image);
+  }
+  *images = replay_images_;
+
   ++emitted_;
   return skeleton_count;
 }

@@ -28,7 +28,8 @@ class SyntheticBackend : public Backend {
   SyntheticBackend(uint32_t skeleton_count, uint32_t hz);
 
   uint32_t NextFrame(NuiFrameHeader* header,
-                     std::vector<NuiSkeleton>* out) override;
+                     std::vector<NuiSkeleton>* skeletons,
+                     std::vector<BackendImage>* images) override;
 
   const char* name() const override { return "synthetic"; }
   uint32_t frames_produced() const override { return frame_id_; }
@@ -38,13 +39,28 @@ class SyntheticBackend : public Backend {
   uint32_t frame_id() const { return frame_id_; }
   uint64_t capture_us() const { return capture_us_; }
 
+  // Depth is off by default so existing recordings and the skeleton's frame size
+  // are unchanged unless asked for. Callers that want the pipeline ordered
+  // depth-first turn it on.
+  void set_depth(bool enabled) { depth_enabled_ = enabled; }
+  bool depth() const { return depth_enabled_; }
+
  private:
   void FillSkeleton(NuiSkeleton* skeleton, uint32_t index, uint64_t t_us) const;
+  // Renders a depth image consistent with `skeletons`. The consistency is the
+  // point: a title that cross-checks a joint against the depth image behind it
+  // should find them agreeing.
+  void RenderDepth(const std::vector<NuiSkeleton>& skeletons);
 
   uint32_t skeleton_count_;
   uint32_t hz_;
   uint32_t frame_id_ = 0;
   uint64_t capture_us_ = 0;
+  bool depth_enabled_ = false;
+  // Owned here because the image pointer handed to the caller must stay valid
+  // until the next NextFrame. Reused across frames to keep this allocation-free
+  // in steady state.
+  std::vector<uint8_t> depth_pixels_;
 };
 
 }  // namespace nui

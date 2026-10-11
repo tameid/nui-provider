@@ -61,6 +61,7 @@ TEST_CASE("session frame size matches the frozen frame encoding", "[session][for
 }
 
 TEST_CASE("record then replay reproduces frames byte for byte", "[session]") {
+  std::vector<nui::BackendImage> images;
   const std::string path = TempSession("roundtrip");
   RemoveTemp(path);
 
@@ -77,7 +78,7 @@ TEST_CASE("record then replay reproduces frames byte for byte", "[session]") {
   std::vector<nui::NuiSkeleton> skeletons;
   nui::NuiFrameHeader header = {};
   for (uint32_t i = 0; i < kFrames; ++i) {
-    source.NextFrame(&header, &skeletons);
+    source.NextFrame(&header, &skeletons, &images);
     REQUIRE(skeletons.size() == kSkeletons);
     REQUIRE(recorder.Append(header, skeletons.data(),
                             static_cast<uint32_t>(skeletons.size())));
@@ -97,7 +98,7 @@ TEST_CASE("record then replay reproduces frames byte for byte", "[session]") {
   std::vector<nui::NuiSkeleton> replayed;
   nui::NuiFrameHeader replay_header = {};
   for (uint32_t i = 0; i < kFrames; ++i) {
-    const uint32_t count = replay.NextFrame(&replay_header, &replayed);
+    const uint32_t count = replay.NextFrame(&replay_header, &replayed, &images);
     REQUIRE(count == kSkeletons);
     REQUIRE(replayed.size() == kSkeletons);
 
@@ -116,6 +117,7 @@ TEST_CASE("record then replay reproduces frames byte for byte", "[session]") {
 }
 
 TEST_CASE("replay reports exhaustion instead of looping", "[session]") {
+  std::vector<nui::BackendImage> images;
   const std::string path = TempSession("exhaust");
   RemoveTemp(path);
 
@@ -133,17 +135,18 @@ TEST_CASE("replay reports exhaustion instead of looping", "[session]") {
   REQUIRE(replay.Open(path, false));
   std::vector<nui::NuiSkeleton> out;
   nui::NuiFrameHeader h = {};
-  REQUIRE(replay.NextFrame(&h, &out) == 1);
-  REQUIRE(replay.NextFrame(&h, &out) == 1);
-  REQUIRE(replay.NextFrame(&h, &out) == 1);
+  REQUIRE(replay.NextFrame(&h, &out, &images) == 1);
+  REQUIRE(replay.NextFrame(&h, &out, &images) == 1);
+  REQUIRE(replay.NextFrame(&h, &out, &images) == 1);
   // Fourth call: no more frames, and not an error.
-  REQUIRE(replay.NextFrame(&h, &out) == 0);
+  REQUIRE(replay.NextFrame(&h, &out, &images) == 0);
   REQUIRE(replay.error().empty());
 
   RemoveTemp(path);
 }
 
 TEST_CASE("replay loops when asked", "[session]") {
+  std::vector<nui::BackendImage> images;
   const std::string path = TempSession("loop");
   RemoveTemp(path);
 
@@ -162,7 +165,7 @@ TEST_CASE("replay loops when asked", "[session]") {
   std::vector<nui::NuiSkeleton> out;
   nui::NuiFrameHeader h = {};
   for (uint32_t i = 0; i < 6; ++i) {
-    REQUIRE(replay.NextFrame(&h, &out) == 1);
+    REQUIRE(replay.NextFrame(&h, &out, &images) == 1);
   }
   REQUIRE(replay.loops() == 2);
   REQUIRE(replay.error().empty());
@@ -171,6 +174,7 @@ TEST_CASE("replay loops when asked", "[session]") {
 }
 
 TEST_CASE("replay exposes the recorded inter-frame interval", "[session]") {
+  std::vector<nui::BackendImage> images;
   const std::string path = TempSession("interval");
   RemoveTemp(path);
 
@@ -188,15 +192,16 @@ TEST_CASE("replay exposes the recorded inter-frame interval", "[session]") {
   REQUIRE(replay.Open(path, false));
   std::vector<nui::NuiSkeleton> out;
   nui::NuiFrameHeader h = {};
-  REQUIRE(replay.NextFrame(&h, &out) == 1);
+  REQUIRE(replay.NextFrame(&h, &out, &images) == 1);
   REQUIRE(replay.current_interval_us() == 0);  // nothing precedes the first
-  REQUIRE(replay.NextFrame(&h, &out) == 1);
+  REQUIRE(replay.NextFrame(&h, &out, &images) == 1);
   REQUIRE(replay.current_interval_us() == 33333);
 
   RemoveTemp(path);
 }
 
 TEST_CASE("replay rejects a file that is not a session", "[session]") {
+  std::vector<nui::BackendImage> images;
   nui::ReplayBackend replay;
   REQUIRE_FALSE(replay.Open("./CMakeLists.txt", false));
   REQUIRE_FALSE(replay.error().empty());
@@ -207,6 +212,7 @@ TEST_CASE("replay rejects a file that is not a session", "[session]") {
 
 TEST_CASE("a recording with no frames is an error, not an empty replay",
           "[session]") {
+  std::vector<nui::BackendImage> images;
   // What a recording killed before Close looks like. Replaying it silently
   // would look like a title that ignored every frame.
   const std::string path = TempSession("empty");
@@ -225,6 +231,7 @@ TEST_CASE("a recording with no frames is an error, not an empty replay",
 
 TEST_CASE("a truncated session is detected rather than half-replayed",
           "[session]") {
+  std::vector<nui::BackendImage> images;
   const std::string path = TempSession("truncated");
   RemoveTemp(path);
 
@@ -252,7 +259,7 @@ TEST_CASE("a truncated session is detected rather than half-replayed",
   std::vector<nui::NuiSkeleton> out;
   nui::NuiFrameHeader h = {};
   uint32_t emitted = 0;
-  while (replay.NextFrame(&h, &out) != 0) {
+  while (replay.NextFrame(&h, &out, &images) != 0) {
     ++emitted;
     REQUIRE(emitted < 16);  // must not spin
   }
@@ -263,6 +270,7 @@ TEST_CASE("a truncated session is detected rather than half-replayed",
 }
 
 TEST_CASE("recording refuses to clobber an existing session", "[session]") {
+  std::vector<nui::BackendImage> images;
   const std::string path = TempSession("clobber");
   RemoveTemp(path);
 
@@ -282,6 +290,7 @@ TEST_CASE("recording refuses to clobber an existing session", "[session]") {
 }
 
 TEST_CASE("recorded frames decode through the frozen codec", "[session]") {
+  std::vector<nui::BackendImage> images;
   // Recording must not invent a second encoding. If a session frame and an IPC
   // frame are the same bytes, a recorded reproduction is faithful.
   const std::string path = TempSession("decode");

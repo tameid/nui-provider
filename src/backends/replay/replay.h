@@ -32,7 +32,8 @@ class ReplayBackend : public Backend {
   // Returns false and sets error() if the file is not a readable session.
   bool Open(const std::string& path, bool loop);
 
-  uint32_t NextFrame(NuiFrameHeader* header, std::vector<NuiSkeleton>* out) override;
+  uint32_t NextFrame(NuiFrameHeader* header, std::vector<NuiSkeleton>* out,
+                     std::vector<BackendImage>* images) override;
 
   const char* name() const override { return "replay"; }
   uint32_t frames_produced() const override { return emitted_; }
@@ -65,6 +66,14 @@ class ReplayBackend : public Backend {
   bool loop_ = false;
   bool realtime_ = false;
   std::string error_;
+  // Backing store for image pointers handed out by NextFrame. The decoded view
+  // points into a scratch buffer that the next read overwrites, so the pixels
+  // are copied here to keep the contract's "valid until the next call" promise.
+  std::vector<BackendImage> replay_images_;
+  // Pixels the pointers in `replay_images_` aim into. Cleared and refilled per
+  // frame so the two stay in step; reserved once the first frame is seen so a
+  // steady-state replay does not reallocate.
+  std::vector<uint8_t> replay_pixels_;
 };
 
 }  // namespace nui

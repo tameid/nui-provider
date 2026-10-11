@@ -16,18 +16,54 @@
 
 namespace nui {
 
-// Bytes EncodeFrame needs for this many skeletons. Excludes skeletons you
-// intend to omit.
+// One image plus its pixels, as a backend hands it over.
+struct EncodedImage {
+  NuiImage header;
+  const uint8_t* data;  // header.data_size bytes, may be null if that is 0
+};
+
+// Bytes EncodeFrame needs for `image_count` images totalling `image_bytes`
+// (headers included).
+inline uint32_t EncodedSize(uint32_t skeletons, uint32_t image_bytes) {
+  return FrameSize(skeletons, image_bytes);
+}
+
+// Bytes EncodeFrame needs for a frame with no images.
 inline uint32_t EncodedSize(uint32_t skeletons) { return FrameSize(skeletons); }
 
 // Writes a frame into `out`, returning bytes written, or 0 if it does not fit.
 //
-// `frame_id` is stamped by the caller rather than the writer because the
-// provider owns the monotonic counter across backends.
+// Images are written in the fixed order depth, ir, color, and the header counts
+// are set from what was actually written rather than from the caller's header -
+// the counts are how a reader walks the payload, so they must not be able to
+// disagree with it.
 inline uint32_t EncodeFrame(const NuiFrameHeader& header, const NuiSkeleton* skeletons,
-                            uint32_t skeleton_count, uint16_t flags, uint8_t* out,
+                            uint32_t skeleton_count, const EncodedImage* images,
+                            uint32_t image_count, uint16_t flags, uint8_t* out,
                             uint32_t capacity) {
-  const uint32_t needed = EncodedSize(skeleton_count);
+  uint32_t depth = 0, ir = 0, color = 0, image_bytes = 0;
+  for (uint32_t i = 0; i < image_count; ++i) {
+    const uint8_t format = images[i].header.format;
+    const uint32_t data_size = images[i].header.data_size;
+    // A payload whose size disagrees with its declared geometry would make the
+    // reader walk off the end. Refuse rather than write a frame we cannot read.
+    if (data_size != ImageDataSize(static_cast<ImageFormat>(format),
+                                   images[i].header.width,
+                                   images[i].header.height)) {
+      return 0;
+    }
+    const uint32_t size = sizeof(NuiImage) + data_size;
+    image_bytes += size;
+    if (format == static_cast<uint8_t>(ImageFormat::kDepth16)) {
+      ++depth;
+    } else if (format == static_cast<uint8_t>(ImageFormat::kIr8)) {
+      ++ir;
+    } else {
+      ++color;
+    }
+  }
+
+  const uint32_t needed = EncodedSize(skeleton_count, image_bytes);
   if (capacity < needed) {
     return 0;
   }
@@ -37,13 +73,45 @@ inline uint32_t EncodeFrame(const NuiFrameHeader& header, const NuiSkeleton* ske
   stamped.version = kVersion1;
   stamped.flags = flags;
   stamped.num_skeletons = skeleton_count;
+  stamped.num_depth_frames = depth;
+  stamped.num_ir_frames = ir;
+  stamped.num_color_frames = color;
 
-  std::memcpy(out, &stamped, sizeof(stamped));
+  uint8_t* at = out;
+  std::memcpy(at, &stamped, sizeof(stamped));
+  at += sizeof(stamped);
+
   if (skeleton_count && skeletons) {
-    std::memcpy(out + sizeof(stamped), skeletons,
-                skeleton_count * sizeof(NuiSkeleton));
+    std::memcpy(at, skeletons, SkeletonsSize(skeleton_count));
+    at += SkeletonsSize(skeleton_count);
   }
-  return needed;
+
+  // Written in the same fixed order the reader walks them.
+  for (int pass = 0; pass < 3; ++pass) {
+    for (uint32_t i = 0; i < image_count; ++i) {
+      const ImageFormat want = pass == 0   ? ImageFormat::kDepth16
+                               : pass == 1 ? ImageFormat::kIr8
+                                           : ImageFormat::kColorBgra8;
+      if (images[i].header.format != static_cast<uint8_t>(want)) {
+        continue;
+      }
+      std::memcpy(at, &images[i].header, sizeof(NuiImage));
+      at += sizeof(NuiImage);
+      if (images[i].header.data_size && images[i].data) {
+        std::memcpy(at, images[i].data, images[i].header.data_size);
+        at += images[i].header.data_size;
+      }
+    }
+  }
+  return static_cast<uint32_t>(at - out);
+}
+
+// Frame with no images, for callers that only have skeletons.
+inline uint32_t EncodeFrame(const NuiFrameHeader& header, const NuiSkeleton* skeletons,
+                            uint32_t skeleton_count, uint16_t flags, uint8_t* out,
+                            uint32_t capacity) {
+  return EncodeFrame(header, skeletons, skeleton_count, nullptr, 0, flags, out,
+                     capacity);
 }
 
 // Fills in a header for `now_us` (host clock) and `capture_us` (sensor clock).

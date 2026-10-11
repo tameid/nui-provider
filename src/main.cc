@@ -34,6 +34,10 @@ void PrintUsage(const char* argv0) {
       "  --replay <path>      play back a recorded .nui session\n"
       "                       (default source is the synthetic backend)\n"
       "  --skeletons <n>      skeletons the synthetic backend emits  (default 1)\n"
+      "  --depth              also emit a 320x240 depth image with the synthetic\n"
+      "                       backend. Off by default: depth is the primitive\n"
+      "                       skeleton is derived from, so it is the payload\n"
+      "                       that matches the real device boundary\n"
       "  --hz <n>             synthetic capture rate                   (default 30)\n"
       "\n"
       "Output:\n"
@@ -93,6 +97,7 @@ int main(int argc, char** argv) {
   uint32_t frame_limit = 0;
   uint32_t interval_ms = 0;
   bool loop = false;
+  bool want_depth = false;
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -116,7 +121,10 @@ int main(int argc, char** argv) {
       ++i;
     } else if (arg == "--skeletons") {
       if (!ParseU32("--skeletons", next, &skeleton_count)) return 2;
-      ++i;
+    } else if (arg == "--depth") {
+      // No value and no ++i: this is a flag, so the loop must advance by the
+      // one argument. Consuming the next one here would eat --frames.
+      want_depth = true;
     } else if (arg == "--hz") {
       if (!ParseU32("--hz", next, &hz) || hz == 0) {
         std::fprintf(stderr, "--hz must be greater than zero\n");
@@ -162,8 +170,11 @@ int main(int argc, char** argv) {
     hz = replay->hz();
     backend = std::move(replay);
   } else {
-    backend = std::make_unique<nui::SyntheticBackend>(skeleton_count, hz);
-    std::printf("synthetic: %u skeleton(s) at %u Hz\n", skeleton_count, hz);
+    auto synthetic = std::make_unique<nui::SyntheticBackend>(skeleton_count, hz);
+    synthetic->set_depth(want_depth);
+    std::printf("synthetic: %u skeleton(s) at %u Hz%s\n", skeleton_count, hz,
+                want_depth ? ", with depth" : "");
+    backend = std::move(synthetic);
   }
 
   nui::FileWriter writer;
@@ -191,6 +202,7 @@ int main(int argc, char** argv) {
 
   nui::NuiFrameHeader header = {};
   std::vector<nui::NuiSkeleton> skeletons;
+  std::vector<nui::BackendImage> images;
 
   uint32_t emitted = 0;
   // A replay with no frame limit runs until the session ends; without this,
@@ -198,9 +210,12 @@ int main(int argc, char** argv) {
   const bool bounded = frame_limit != 0;
 
   while (!bounded || emitted < frame_limit) {
-    const uint32_t count = backend->NextFrame(&header, &skeletons);
-    if (count == 0) {
-      // Either the source ended or it failed. Only a failure has an error.
+    const uint32_t count = backend->NextFrame(&header, &skeletons, &images);
+    if (count == 0 && images.empty()) {
+      // No skeletons and no images: either the source ended or it failed. A
+      // frame carrying only depth is legitimate and must not end the loop, which
+      // is why this tests both rather than the skeleton count alone.
+      // Only a failure has an error.
       nui::ReplayBackend* as_replay = dynamic_cast<nui::ReplayBackend*>(backend.get());
       if (as_replay != nullptr && !as_replay->error().empty()) {
         std::fprintf(stderr, "replay failed at frame %u: %s\n", emitted,
@@ -213,7 +228,8 @@ int main(int argc, char** argv) {
     }
 
     if (!writer.Write(header, skeletons.data(),
-                      static_cast<uint32_t>(skeletons.size()))) {
+                      static_cast<uint32_t>(skeletons.size()), images.data(),
+                      static_cast<uint32_t>(images.size()))) {
       std::fprintf(stderr, "write failed: %s\n", writer.error().c_str());
       recorder.Close();
       return 1;

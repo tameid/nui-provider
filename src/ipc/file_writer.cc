@@ -101,15 +101,34 @@ bool FileWriter::WriteSlot(uint32_t slot, const uint8_t* data, uint32_t size) {
 
 bool FileWriter::Write(const NuiFrameHeader& header, const NuiSkeleton* skeletons,
                        uint32_t skeleton_count) {
-  const uint32_t needed = EncodedSize(skeleton_count);
+  return Write(header, skeletons, skeleton_count, nullptr, 0);
+}
+
+bool FileWriter::Write(const NuiFrameHeader& header, const NuiSkeleton* skeletons,
+                       uint32_t skeleton_count, const BackendImage* images,
+                       uint32_t image_count) {
+  uint32_t image_bytes = 0;
+  for (uint32_t i = 0; i < image_count; ++i) {
+    image_bytes += sizeof(NuiImage) + images[i].header.data_size;
+  }
+
+  const uint32_t needed = EncodedSize(skeleton_count, image_bytes);
   scratch_.resize(needed);
 
-  const uint32_t written = EncodeFrame(header, skeletons, skeleton_count,
-                                       static_cast<uint16_t>(header.flags),
-                                       scratch_.data(),
-                                       static_cast<uint32_t>(scratch_.size()));
+  std::vector<EncodedImage> to_encode;
+  to_encode.reserve(image_count);
+  for (uint32_t i = 0; i < image_count; ++i) {
+    to_encode.push_back(EncodedImage{images[i].header, images[i].data});
+  }
+
+  const uint32_t written =
+      EncodeFrame(header, skeletons, skeleton_count,
+                  image_count ? to_encode.data() : nullptr, image_count,
+                  static_cast<uint16_t>(header.flags), scratch_.data(),
+                  static_cast<uint32_t>(scratch_.size()));
   if (written == 0) {
-    error_ = "encode failed for " + std::to_string(skeleton_count) + " skeletons";
+    error_ = "encode failed for " + std::to_string(skeleton_count) +
+             " skeletons, " + std::to_string(image_count) + " image(s)";
     return false;
   }
 

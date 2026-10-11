@@ -123,6 +123,60 @@ struct NuiFrameHeader {
 };
 static_assert(sizeof(NuiFrameHeader) == 44, "Size matters - it is on the wire");
 
+// Image payloads. Depth comes first in the pipeline and skeleton is derived
+// from it (see docs/kinect_support.md 4a), so depth is the primitive a provider
+// should be producing and skeleton is the computed product.
+//
+// The formats are the real NUI ones, not convenient ones. A depth pixel is
+// 16-bit little-endian with the player index in bits 0-2 and the distance in
+// millimetres in bits 3-15 - the player index rides along in the depth image
+// precisely because the tracking engine put it there.
+enum class ImageFormat : uint8_t {
+  kDepth16 = 1,   // 2 bytes/px: player index (0-2), depth mm (3-15)
+  kIr8 = 2,       // 1 byte/px, monochrome infrared
+  kColorBgra8 = 3,// 4 bytes/px
+};
+
+// One image in a frame. `data` points at header.data_size bytes immediately
+// following this header in the encoded frame.
+struct NuiImage {
+  uint16_t width;
+  uint16_t height;
+  uint8_t format;          // ImageFormat
+  uint8_t reserved0;
+  uint32_t data_size;      // bytes of pixel data, excluding this header
+};
+// Packed: 2 + 2 + 1 + 1 + 4 = 10.
+static_assert(sizeof(NuiImage) == 10, "Size matters - it is on the wire");
+
+// Bytes one image of `format` occupies in `width` x `height`.
+constexpr uint32_t ImageDataSize(ImageFormat format, uint32_t width, uint32_t height) {
+  return width * height * (format == ImageFormat::kDepth16    ? 2u
+                           : format == ImageFormat::kIr8      ? 1u
+                           : format == ImageFormat::kColorBgra8 ? 4u
+                                                                : 0u);
+}
+
+// Depth pixel helpers. The shift is the wire's, not ours.
+constexpr uint32_t kDepthMaxMillimetres = 8191;  // 13 bits, per NUI
+constexpr uint16_t PackDepthPixel(uint16_t depth_mm, uint8_t player_index) {
+  return static_cast<uint16_t>(((depth_mm & kDepthMaxMillimetres) << 3) |
+                               (player_index & 0x7));
+}
+constexpr uint16_t DepthPixelMillimetres(uint16_t pixel) {
+  return static_cast<uint16_t>(pixel >> 3);
+}
+constexpr uint8_t DepthPixelPlayerIndex(uint16_t pixel) {
+  return static_cast<uint8_t>(pixel & 0x7);
+}
+
+// The Xbox 360 Kinect's depth resolution. Quoting the retail spec rather than
+// picking a size: a title that hard-codes 320x240 must not be handed 640x480.
+constexpr uint16_t kDepthWidth = 320;
+constexpr uint16_t kDepthHeight = 240;
+constexpr uint16_t kColorWidth = 640;
+constexpr uint16_t kColorHeight = 480;
+
 enum FrameFlags : uint16_t {
   // At least one skeleton in this frame is provisional: tracking has not yet
   // confirmed it. A title should render it but not act on it.
@@ -160,9 +214,36 @@ enum SkeletonFlags : uint8_t {
 // otherwise.
 constexpr uint32_t PayloadOffset() { return sizeof(NuiFrameHeader); }
 
-// Bytes needed for a frame carrying `skeletons` skeletons and no images.
+// Payload order within an encoded frame:
+//
+//   skeletons[]  then  depth[]  then  ir[]  then  color[]
+//
+// The header's four counts say how many of each are present, and they are the
+// only way to walk this - there is no length prefix per section. They were
+// reserved in v1 and are now used, which is why this needed no version bump:
+// v1 always had room for images, it just never carried any.
+//
+// Bytes the skeleton block occupies.
+constexpr uint32_t SkeletonsSize(uint32_t skeletons) {
+  return skeletons * sizeof(NuiSkeleton);
+}
+
+// Offset of the first image of `format`, given the skeleton and image counts
+// that precede it. Images follow skeletons in the fixed order above.
+constexpr uint32_t ImagesOffset(uint32_t skeletons) {
+  return PayloadOffset() + SkeletonsSize(skeletons);
+}
+
+// Bytes needed for a frame carrying `skeletons` skeletons and `images` image
+// payloads of the given total encoded size.
+constexpr uint32_t FrameSize(uint32_t skeletons, uint32_t image_bytes) {
+  return ImagesOffset(skeletons) + image_bytes;
+}
+
+// The skeleton-only size, kept because most callers and all existing
+// recordings use it.
 constexpr uint32_t FrameSize(uint32_t skeletons) {
-  return PayloadOffset() + skeletons * sizeof(NuiSkeleton);
+  return FrameSize(skeletons, 0u);
 }
 
 // True if a header is worth parsing. Cheap, and rejects a truncated or

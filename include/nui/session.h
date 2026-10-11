@@ -67,6 +67,11 @@ constexpr bool SessionHeaderLooksValid(const SessionHeader& header) {
 
 // Bytes one frame occupies inside a session: the frozen frame encoding, with no
 // container overhead. Identical to the IPC .bin payload.
+//
+// Images are included, and their size is not knowable from the skeleton count
+// alone - a frame's images carry their own geometry in NuiImage headers. The
+// reader therefore walks the payload rather than assuming a size, and this
+// helper is only for writers that already know their images.
 constexpr uint32_t SessionFrameSize(uint32_t skeletons) {
   return sizeof(NuiFrameHeader) + skeletons * sizeof(NuiSkeleton);
 }
